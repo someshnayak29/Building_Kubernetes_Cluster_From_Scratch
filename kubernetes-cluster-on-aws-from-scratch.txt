@@ -1,0 +1,435 @@
+# Prerequisite
+
+1. Install AWS CLI or use Cloudshell
+2. Create new user having EC2 and VPC full access
+3. Create Access Keys for user for authorization on CLI
+4. Configure AWS CLI
+
+
+# Building a Kubernetes cluster on AWS from scratch 
+
+
+Installing some client tools we need
+
+wget -q --timestamping \
+  https://storage.googleapis.com/kubernetes-the-hard-way/cfssl/1.4.1/linux/cfssl \
+  https://storage.googleapis.com/kubernetes-the-hard-way/cfssl/1.4.1/linux/cfssljson
+
+wget https://storage.googleapis.com/kubernetes-release/release/v1.21.0/bin/linux/amd64/kubectl
+chmod +x kubectl
+sudo mv kubectl /usr/local/bin/
+kubectl version --client
+
+Provisioning Compute Infrastructure ( VMs : Master Node & Worker Node )
+
+VPC
+
+VPC_ID=$(aws ec2 create-vpc --cidr-block 10.0.0.0/16 --output text --query 'Vpc.VpcId')
+
+aws ec2 create-tags --resources ${VPC_ID} --tags Key=Name,Value=kubernetes-from-scratch
+
+aws ec2 modify-vpc-attribute --vpc-id ${VPC_ID} --enable-dns-support '{"Value": true}'
+
+aws ec2 modify-vpc-attribute --vpc-id ${VPC_ID} --enable-dns-hostnames '{"Value": true}'
+
+
+Private Subnet
+
+SUBNET_ID=$(aws ec2 create-subnet \
+  --vpc-id ${VPC_ID} \
+  --cidr-block 10.0.1.0/24 \
+  --output text --query 'Subnet.SubnetId')
+
+aws ec2 create-tags --resources ${SUBNET_ID} --tags Key=Name,Value=kubernetes-pvt
+
+
+Internet Gateway ( If required )
+
+INTERNET_GATEWAY_ID=$(aws ec2 create-internet-gateway --output text --query 'InternetGateway.InternetGatewayId')
+
+aws ec2 create-tags --resources ${INTERNET_GATEWAY_ID} --tags Key=Name,Value=kubernetes-igw
+
+aws ec2 attach-internet-gateway --internet-gateway-id ${INTERNET_GATEWAY_ID} --vpc-id ${VPC_ID}
+
+
+Route Table ( If required )
+
+ROUTE_TABLE_ID=$(aws ec2 create-route-table --vpc-id ${VPC_ID} --output text --query 'RouteTable.RouteTableId')
+
+aws ec2 create-tags --resources ${ROUTE_TABLE_ID} --tags Key=Name,Value=kubernetes-rt
+
+aws ec2 associate-route-table --route-table-id ${ROUTE_TABLE_ID} --subnet-id ${SUBNET_ID}
+
+aws ec2 create-route --route-table-id ${ROUTE_TABLE_ID} --destination-cidr-block 0.0.0.0/0 --gateway-id ${INTERNET_GATEWAY_ID}
+
+
+Security Group
+
+
+SECURITY_GROUP_ID=$(aws ec2 create-security-group \
+  --group-name kubernetes-from-scratch \
+  --description "Kubernetes from scratch - security group" \
+  --vpc-id ${VPC_ID} \
+  --output text --query 'GroupId')
+
+aws ec2 create-tags --resources ${SECURITY_GROUP_ID} --tags Key=Name,Value=kubernetes-sg
+
+aws ec2 authorize-security-group-ingress --group-id ${SECURITY_GROUP_ID} --protocol all --cidr 10.0.0.0/16
+
+aws ec2 authorize-security-group-ingress --group-id ${SECURITY_GROUP_ID} --protocol all --cidr 10.200.0.0/16
+
+aws ec2 authorize-security-group-ingress --group-id ${SECURITY_GROUP_ID} --protocol tcp --port 22 --cidr 0.0.0.0/0
+
+aws ec2 authorize-security-group-ingress --group-id ${SECURITY_GROUP_ID} --protocol tcp --port 6443 --cidr 0.0.0.0/0
+
+aws ec2 authorize-security-group-ingress --group-id ${SECURITY_GROUP_ID} --protocol tcp --port 443 --cidr 0.0.0.0/0
+
+aws ec2 authorize-security-group-ingress --group-id ${SECURITY_GROUP_ID} --protocol icmp --port -1 --cidr 0.0.0.0/0
+
+
+Network Load Balancer ( If required, you can use other methods also, i.e. NodePort )
+
+
+LOAD_BALANCER_ARN=$(aws elbv2 create-load-balancer \
+    --name kubernetes-nlb \
+    --subnets ${SUBNET_ID} \
+    --scheme internet-facing \
+    --type network \
+    --output text --query 'LoadBalancers[].LoadBalancerArn')
+
+TARGET_GROUP_ARN=$(aws elbv2 create-target-group \
+    --name kubernetes-tg \
+    --protocol TCP \
+    --port 6443 \
+    --vpc-id ${VPC_ID} \
+    --target-type ip \
+    --output text --query 'TargetGroups[].TargetGroupArn')
+
+aws elbv2 register-targets --target-group-arn ${TARGET_GROUP_ARN} --targets Id=10.0.1.1{0,1,2}
+
+aws elbv2 create-listener \
+    --load-balancer-arn ${LOAD_BALANCER_ARN} \
+    --protocol TCP \
+    --port 443 \
+    --default-actions Type=forward,TargetGroupArn=${TARGET_GROUP_ARN} \
+    --output text --query 'Listeners[].ListenerArn'
+
+
+public DNS address of our load balancer :
+
+KUBERNETES_PUBLIC_ADDRESS=$(aws elbv2 describe-load-balancers \
+  --load-balancer-arns ${LOAD_BALANCER_ARN} \
+  --output text --query 'LoadBalancers[].DNSName')
+
+
+Compute Instances
+
+IMAGE_ID=$(aws ec2 describe-images --owners 099720109477 \
+  --output json \
+  --filters \
+  'Name=root-device-type,Values=ebs' \
+  'Name=architecture,Values=x86_64' \
+  'Name=name,Values=ubuntu/images/hvm-ssd/ubuntu-focal-20.04-amd64-server-*' \
+  | jq -r '.Images|sort_by(.Name)[-1]|.ImageId')
+
+
+# create a key-pair so we can use it to securely connect to our instances
+
+aws ec2 create-key-pair --key-name kubernetes --output text --query 'KeyMaterial' > kubernetes.id_rsa
+
+chmod 600 kubernetes.id_rsa
+
+
+
+Kubernetes Controller ( Control plane i.e. Master Nodes )
+
+for i in 0 1 2; do
+  instance_id=$(aws ec2 run-instances \
+    --associate-public-ip-address \
+    --image-id ${IMAGE_ID} \
+    --count 1 \
+    --key-name kubernetes \
+    --security-group-ids ${SECURITY_GROUP_ID} \
+    --instance-type t3.micro \
+    --private-ip-address 10.0.1.1${i} \
+    --user-data "name=controller-${i}" \
+    --subnet-id ${SUBNET_ID} \
+    --block-device-mappings='{"DeviceName": "/dev/sda1", "Ebs": { "VolumeSize": 50 }, "NoDevice": "" }' \
+    --output text --query 'Instances[].InstanceId')
+  aws ec2 modify-instance-attribute --instance-id ${instance_id} --no-source-dest-check
+  aws ec2 create-tags --resources ${instance_id} --tags "Key=Name,Value=controller-${i}"
+  echo "controller-${i} created "
+done
+
+
+
+Worker Nodes
+
+for i in 0 1 2; do
+  instance_id=$(aws ec2 run-instances \
+    --associate-public-ip-address \
+    --image-id ${IMAGE_ID} \
+    --count 1 \
+    --key-name kubernetes \
+    --security-group-ids ${SECURITY_GROUP_ID} \
+    --instance-type t3.micro \
+    --private-ip-address 10.0.1.2${i} \
+    --user-data "name=worker-${i}|pod-cidr=10.200.${i}.0/24" \
+    --subnet-id ${SUBNET_ID} \
+    --block-device-mappings='{"DeviceName": "/dev/sda1", "Ebs": { "VolumeSize": 50 }, "NoDevice": "" }' \
+    --output text --query 'Instances[].InstanceId')
+  aws ec2 modify-instance-attribute --instance-id ${instance_id} --no-source-dest-check
+  aws ec2 create-tags --resources ${instance_id} --tags "Key=Name,Value=worker-${i}"
+  echo "worker-${i} created"
+done
+
+
+# Setting up Kubeadm
+
+=> open 2 terminals one for master other for worker
+
+# Master
+
+ssh -i kubernetes.id_rsa ubuntu@publicip        ( Her public ip is public IPV4 address of ec2 instance of master node)
+
+=> If error comes in above command like permission denied ( public key ) in libcrypto solved by creating a new vpc and subnet and not using default one
+
+sudo -i
+
+apt-get update && apt-get upgrade -y
+
+apt-get install -y vim
+
+sudo swapoff -a
+
+apt-get install -y docker.io
+
+mkdir -p /etc/apt/keyrings/
+
+sudo apt-get install -y apt-transport-https ca-certificates curl gpg
+
+curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /' | sudo tee /etc/apt/sources.list.d/kubernetes.list
+
+sudo apt-get update
+sudo apt-get install -y kubelet kubeadm kubectl
+sudo apt-mark hold kubelet kubeadm kubectl
+
+# pod network
+wget https://docs.projectcalico.org/manifests/calico.yaml
+cat calico.yaml | grep -A1 CALICO_IPV4POOL_CIDR
+hostname -i
+
+add alias to CP & worker nodes
+vi /etc/hosts
+10.0.1.10 k8scp  => here ip is of control plane
+10.0.1.20 worker => can give alias for worker ip also
+
+Configure docker to use proper cgroup
+vim /etc/docker/daemon.json
+{
+"exec-opts": ["native.cgroupdriver=systemd"],
+"log-driver": "json-file",
+"log-opts": {
+"max-size": "100m"
+},
+"storage-driver": "overlay2"
+}
+
+systemctl restart docker ;
+sleep 20 ; systemctl status docker
+
+vim kubeadm-config.yaml
+
+Press <i>
+
+kind: ClusterConfiguration
+apiVersion: kubeadm.k8s.io/v1beta3
+kubernetesVersion: v1.29.1
+controlPlaneEndpoint: "k8scp:6443"
+networking:
+  podSubnet: 192.168.0.0/16
+---
+kind: KubeletConfiguration
+apiVersion: kubelet.config.k8s.io/v1beta1
+cgroupDriver: systemd
+
+Press <esc>
+Press : then wq! to save
+
+// To initialize control plane
+
+kubeadm init --config kubeadm-config.yaml --upload-certs | tee kubeadm-init.out
+
+
+# Apply network plugin on master node
+
+sudo cp /root/calico.yaml .
+
+// no need to copy if file already exists
+
+kubectl apply -f calico.yaml
+
+// if above command gives error like : connection refused and localhost:8080 …
+
+Then apply the below commands on master node
+
+exit  // to exit root
+
+mkdir -p $HOME/ .kube
+
+sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+
+sudo chown $(id -u):$(id -g) $HOME/.kube/config
+
+// now u can use kubectl apply -f calico.yaml command
+
+
+
+
+# Worker
+
+
+ssh -i kubernetes.id_rsa ubuntu@publicip        ( Her public ip is public IPV4 address of ec2 instance of worker node)
+
+sudo -i
+
+apt-get update && apt-get upgrade -y
+
+apt-get install -y vim
+
+sudo swapoff -a
+
+apt-get install -y docker.io
+
+sudo apt-get update
+sudo apt-get install -y kubelet kubeadm kubectl
+sudo apt-mark hold kubelet kubeadm kubectl
+
+=> installing kubeadm is not required on worker node, it is only for control plane
+
+
+# pod network
+wget https://docs.projectcalico.org/manifests/calico.yaml
+cat calico.yaml | grep -A1 CALICO_IPV4POOL_CIDR
+hostname -i
+
+add alias to CP & worker nodes
+vi /etc/hosts
+10.0.1.10 k8scp  => here ip is of control plane
+10.0.1.20 worker => can give alias for worker ip also
+
+Configure docker to use proper cgroup
+vim /etc/docker/daemon.json
+{
+"exec-opts": ["native.cgroupdriver=systemd"],
+"log-driver": "json-file",
+"log-opts": {
+"max-size": "100m"
+},
+"storage-driver": "overlay2"
+}
+
+systemctl restart docker ;
+sleep 20 ; systemctl status docker
+
+vim kubeadm-config.yaml
+
+kind: KubeletConfiguration
+apiVersion: kubelet.config.k8s.io/v1beta1
+cgroupDriver: systemd
+
+// To join worker node to cluster
+// you will get this command when you run init on control plane
+
+kubeadm join k8scp:6443 --token 70aidd.innevy6m6uavcvmd --discovery-token-ca-cert-hash sha256:f25f871a92f8a6c703f1012cf1ffa8a15d0e7488a60f858035044132edb1077a
+
+// Here, token and sha256 hash key is your own token and hash key
+// to find out token, type this on control plane terminal
+
+kubedam token list  // the one with authentication, signing system …. In usage is your token
+
+// for ssh key
+
+ls /etc/kubernetes/pki/
+
+// there u will get certificate as ca.crt
+// extract the public key from the ca.crt certificate file, convert it to DER format, and then calculate its SHA-256 hash using OpenSSL
+
+openssl x509 -pubkey -in /etc/kubernetes/pki/ca.crt | openssl rsa -pubin -outform der 2>/dev/null | openssl dgst -sha256 -hex | sed ’s/^.* //‘
+
+// This command will give u the sha256 key to be used
+
+————
+
+// Now our K8s cluster is set up and we can use it to deploy our applications, container, and these command will only work on master node as it has kube config file
+
+—————————————
+
+// Now on master node outside of root privileges i.e. ubuntu@ip….
+
+kubectl create deployment nginx --image=nginx --port 80
+
+kubectl get deployments
+
+kubectl describe deployment nginx
+
+kubectl get events
+
+kubectl expose deployment nginx --type=LoadBalancer
+
+kubectl get svc nginx
+kubectl get ep nginx
+
+
+
+kubectl get deployment nginx -o yaml
+
+kubectl get deployment nginx -o yaml > first.yaml
+
+vim first.yaml
+Remove the creationTimestamp,
+resourceVersion, and uid lines. Also remove all the lines including and after status:,
+
+kubectl delete deployment nginx
+
+kubectl create -f first.yaml
+
+kubectl create deployment two --image=nginx --dry-run=client -o yaml
+
+kubectl get deployment
+
+kubectl expose deployment/nginx
+kubectl get svc nginx
+kubectl get ep nginx
+
+
+
+kubectl exec nginx-1423793266-13p69 -- printenv |grep KUBERNETES
+
+
+// kubectl describe pods <pod name> will show u that although we are executing commands on master node, but container is being deployed on worker node, showing us that, cluster is successfully formed and master node control plane is deploying applications/containers on worker nodes.
+
+
+
+
+# References
+
+ https://medium.com/geekculture/building-a-kubernetes-cluster-on-aws-from-scratch-7e1e8b0342c4
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
