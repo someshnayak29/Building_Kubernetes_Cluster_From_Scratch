@@ -1,0 +1,282 @@
+// To list the Resource Group
+az group list --query '[].name' -o table
+
+user-nxmciybcytqz
+
+
+Username:user-nxmciybcytqz@oreilly-cloudlabs.com
+Password: 3KhrSlO0b82N4nE
+
+// Creating a VNet and Subnet
+
+az network vnet create -g user-nxmciybcytqz -n KubeVNet --address-prefix 10.0.0.0/16 \
+  --subnet-name MySubnet --subnet-prefix 10.0.1.0/24
+
+// Creating VM for Master Node
+
+az vm create \
+    --admin-password 3KhrSlO0b82N4nE \
+    --admin-username usernxmciybcytqz \
+    --resource-group user-nxmciybcytqz \
+    --name kube-master1773 \
+    --image Canonical:0001-com-ubuntu-server-focal:20_04-lts-gen2:20.04.202406140 \
+    --size Standard_DS2_v2 \
+    --data-disk-sizes-gb 10 \
+    --generate-ssh-keys \
+    --public-ip-address-dns-name kubeadm-master1773
+
+// Creating VM for Worker Nodes
+
+az vm create \
+    --admin-password 3KhrSlO0b82N4nE \
+    --admin-username usernxmciybcytqz \
+    --resource-group user-nxmciybcytqz \
+    --name kube-worker-17731 \
+    --image Canonical:0001-com-ubuntu-server-focal:20_04-lts-gen2:20.04.202406140 \
+    --size Standard_DS2_v2 \
+    --data-disk-sizes-gb 10 \
+    --generate-ssh-keys \
+    --public-ip-address-dns-name kubeadm-worker-17731
+
+
+az vm create \
+    --admin-password 3KhrSlO0b82N4nE \
+    --admin-username usernxmciybcytqz \
+    --resource-group user-nxmciybcytqz \
+    --name kube-worker-17732 \
+    --image Canonical:0001-com-ubuntu-server-focal:20_04-lts-gen2:20.04.202406140 \
+    --size Standard_DS2_v2 \
+    --data-disk-sizes-gb 10 \
+    --generate-ssh-keys \
+    --public-ip-address-dns-name kubeadm-worker-17732
+
+
+4.246.153.12 master
+4.246.156.220 worker1
+172.171.204.64 worker2
+
+// Copy Private and Public Ip addresses of VMs
+master
+"privateIpAddress": "10.0.1.4",
+  "publicIpAddress": "13.90.131.6",
+
+worker
+"privateIpAddress": "10.0.1.5",
+  "publicIpAddress": "13.82.88.183",
+
+
+/* az network nic show --ids /subscriptions/889ebf7a-d3d3-4903-9dff-c52031dea3d0/resourceGroups/user-msozpfqaqctj/providers/Microsoft.Network/networkInterfaces/kube-worker-1VMNic --query "ipConfigurations[0].publicIpAddress.ipAddress" -o tsv
+
+*/
+
+Here, IP used is Public Ip
+
+// ssh into our VMs
+
+ssh usernxmciybcytqz@13.90.131.6
+ssh usernxmciybcytqz@13.82.88.183
+ssh usernxmciybcytqz@20.185.31.104
+
+// These steps need to be performed on all nodes
+
+# Install Docker
+
+sudo -i
+sudo apt update
+sudo apt install docker.io -y
+sudo systemctl enable docker
+
+apt-get install -y vim
+
+apt-get update && apt-get upgrade -y
+sudo swapoff -a
+
+mkdir -p /etc/apt/keyrings/
+
+sudo apt-get install -y apt-transport-https ca-certificates curl gnupg
+curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+
+echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /' | sudo tee /etc/apt/sources.list.d/kubernetes.list
+
+sudo apt-get update
+
+sudo apt-get install -y kubelet kubeadm kubectl
+sudo apt-mark hold kubelet kubeadm kubectl
+
+--------------------------------------------------------------------------------------------------
+
+// Master Node
+
+# pod network
+wget https://docs.projectcalico.org/manifests/calico.yaml
+cat calico.yaml | grep -A1 CALICO_IPV4POOL_CIDR
+hostname -i
+
+add alias to CP & worker nodes
+vi /etc/hosts
+10.0.1.10 k8scp  => here ip is of control plane
+10.0.1.20 worker => can give alias for worker ip also
+
+Configure docker to use proper cgroup
+vim /etc/docker/daemon.json
+{
+"exec-opts": ["native.cgroupdriver=systemd"],
+"log-driver": "json-file",
+"log-opts": {
+"max-size": "100m"
+},
+"storage-driver": "overlay2"
+}
+
+systemctl restart docker ;
+sleep 20 ; systemctl status docker
+
+vim kubeadm-config.yaml
+
+Press <i>
+
+kind: ClusterConfiguration
+apiVersion: kubeadm.k8s.io/v1beta3
+kubernetesVersion: v1.29.1
+controlPlaneEndpoint: "k8scp:6443"
+networking:
+  podSubnet: 192.168.0.0/16
+---
+kind: KubeletConfiguration
+apiVersion: kubelet.config.k8s.io/v1beta1
+cgroupDriver: systemd
+
+Press <esc>
+Press : then wq! to save
+
+# To initialize control plane
+
+kubeadm init --config kubeadm-config.yaml --upload-certs | tee kubeadm-init.out
+
+# Apply network plugin on master node
+
+exit  // to exit root
+
+sudo cp /root/calico.yaml .
+
+// no need to copy if file already exists
+
+kubectl apply -f calico.yaml
+
+// if above command gives error like : connection refused and localhost:8080 …
+
+Then apply the below commands on master node
+
+mkdir -p $HOME/ .kube
+
+sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+
+sudo chown $(id -u):$(id -g) $HOME/.kube/config
+
+// now u can use kubectl apply -f calico.yaml command
+
+-----------------------------------------------------------------------------------------
+
+// Worker Node
+
+=> installing kubeadm is not required on worker node, it is only for control plane
+
+
+# pod network
+wget https://docs.projectcalico.org/manifests/calico.yaml
+cat calico.yaml | grep -A1 CALICO_IPV4POOL_CIDR
+hostname -i
+
+add alias to CP & worker nodes
+vi /etc/hosts
+10.0.1.10 k8scp  => here ip is of control plane
+10.0.1.20 worker => can give alias for worker ip also
+
+Configure docker to use proper cgroup
+vim /etc/docker/daemon.json
+{
+"exec-opts": ["native.cgroupdriver=systemd"],
+"log-driver": "json-file",
+"log-opts": {
+"max-size": "100m"
+},
+"storage-driver": "overlay2"
+}
+
+systemctl restart docker ;
+sleep 20 ; systemctl status docker
+
+vim kubeadm-config.yaml
+
+kind: KubeletConfiguration
+apiVersion: kubelet.config.k8s.io/v1beta1
+cgroupDriver: systemd
+
+// To join worker node to cluster
+// you will get this command when you run init on control plane
+
+
+kubeadm join k8scp:6443 --token qrrgxe.gljd6mnax8uasffg \
+        --discovery-token-ca-cert-hash sha256:656a4622b91d8f0efc2e2a7f13862b4bacd1dfa6d8121cc6a701d94488305f86 
+
+
+
+---------------------------------------------------------------------------------------------------------------
+
+// Now on master node i.e. one with control plane outside of root privileges i.e. ubuntu@ip….
+
+kubectl create deployment nginx --image=nginx --port 80
+
+kubectl get deployments
+
+kubectl describe deployment nginx
+
+kubectl get events
+
+kubectl expose deployment nginx --type=LoadBalancer
+
+kubectl get svc nginx
+kubectl get ep nginx
+
+
+
+kubectl get deployment nginx -o yaml
+
+kubectl get deployment nginx -o yaml > first.yaml
+
+vim first.yaml
+Remove the creationTimestamp,
+resourceVersion, and uid lines. Also remove all the lines including and after status:,
+
+kubectl delete deployment nginx
+
+kubectl create -f first.yaml
+
+kubectl create deployment two --image=nginx --dry-run=client -o yaml
+
+kubectl get deployment
+
+kubectl expose deployment/nginx
+kubectl get svc nginx
+kubectl get ep nginx
+
+
+
+kubectl exec nginx-1423793266-13p69 -- printenv |grep KUBERNETES
+
+
+// kubectl describe pods <pod name> will show u that although we are executing commands on master node, but container is being deployed on worker node, showing us that, cluster is successfully formed and master node control plane is deploying applications/containers on worker nodes.
+
+
+
+
+# References
+
+ https://medium.com/@patnaikshekhar/creating-a-kubernetes-cluster-in-azure-using-kubeadm-96e7c1ede4a
+
+
+
+
+
+
